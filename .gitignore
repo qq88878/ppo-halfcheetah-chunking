@@ -14,3 +14,6 @@ true/
 notes_append.xml
 err.txt
 *_old_backup.pt
+
+# 训练日志（临时）
+*.log

@@ -11,8 +11,9 @@ class RolloutBuffer:
         self.values    = np.zeros(rollout_size, dtype=np.float32)   # Critic 预测 V(s)
         self.ptr = 0    # 写指针：下一个存哪
         self.size = 0   # 已存条数
+        self.dec_obs= np.zeros((rollout_size,obs_dim),dtype=np.float32)
 
-    def store(self, obs, action, reward, done, log_prob, value):
+    def store(self, obs, action, reward, done, log_prob, value, dec_obs):
         """收集循环每走一步调用一次"""
         self.obs[self.ptr]       = obs
         self.actions[self.ptr]   = action
@@ -20,6 +21,7 @@ class RolloutBuffer:
         self.dones[self.ptr]     = done
         self.log_probs[self.ptr] = log_prob
         self.values[self.ptr]    = value
+        self.dec_obs[self.ptr]   = dec_obs   # 记录该动作所属决策点的 obs
         self.ptr += 1
         self.size += 1
 

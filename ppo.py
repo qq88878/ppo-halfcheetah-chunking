@@ -18,33 +18,42 @@ class PPO():
         self.val_coef=0.5          #critic网络预测结果在损失函数中乘的比率（这个是为啥）
 
     def update(self):
-        obs = torch.from_numpy(self.buffer.obs[:self.buffer.size])
-        actions = torch.from_numpy(self.buffer.actions[:self.buffer.size])
-        old_logp = torch.from_numpy(self.buffer.log_probs[:self.buffer.size])
-        adv = torch.from_numpy(self.advantages)
+        n = self.buffer.size
+        n_blocks = n // self.actor.K                      # 决策点数量
+        K = self.actor.K
+        act_dim = self.actor.action_dim
+
+        # ---- critic 用：每步真实状态（不变） ----
+        obs_all = torch.from_numpy(self.buffer.obs[:n])
         ret = torch.from_numpy(self.returns)
+
+        # ---- actor 用：决策点粒度（块级） ----
+        dec_obs = torch.from_numpy(self.buffer.dec_obs[:n])[::K]     # (n_blocks,17) 每块取第一行
+        actions_block = torch.from_numpy(self.buffer.actions[:n]).view(n_blocks, K * act_dim)  # 把 K 行动作拼回整块
+        old_logp_block = torch.from_numpy(self.buffer.log_probs[:n])[::K]   # 每块一个整块 logp
+        adv = torch.from_numpy(self.advantages)
+        adv_block = adv.view(n_blocks, K).mean(-1)        # 块内 K 个 advantage 取平均
+        adv_block = (adv_block - adv_block.mean()) / (adv_block.std() + 1e-8)   # 块级归一化
         optimizer=torch.optim.Adam(list(self.actor.parameters())+list(self.critic.parameters()),self.lr)
 
-        adv=(adv-adv.mean())/(adv.std()+1e-8)  #不应该在循环里处理吗，为啥这里是整个循环外进行处理
-
         for _ in range(self.epoch):
-            dist=self.actor.get_dist(obs)
-            u=0.5*torch.log((1+actions.clamp(-0.9999,0.9999))/(1-actions.clamp(-0.9999,0.9999)))
-            new_logp=dist.log_prob(u).sum(-1)-torch.log(1-actions**2+1e-6).sum(-1)#这里为啥还需要个sum?newlogp是不是当前参数再次预测这些action对概率进行提取后续与old进行对比修改
+            dist=self.actor.get_dist(dec_obs)             # 决策点状态 → 整块 24 维分布
+            u=0.5*torch.log((1+actions_block.clamp(-0.9999,0.9999))/(1-actions_block.clamp(-0.9999,0.9999)))
+            new_logp=dist.log_prob(u).sum(-1)-torch.log(1-actions_block**2+1e-6).sum(-1)   # 整块联合概率
 
-            ratio=torch.exp(new_logp-old_logp)#这里就是算变化的比率，但为啥exp中间是减法，不是二者做商吗
+            ratio=torch.exp(new_logp-old_logp_block)      # 块级新旧概率比
 
-            sur1=ratio*adv
-            sur2 = torch.clamp(ratio, 1 - self.clip_eps, 1 + self.clip_eps) * adv#我用的是sur2=min(ratio,1-self.clip_eps,1+self.clip_eps)*adv，区别在哪
+            sur1=ratio*adv_block
+            sur2 = torch.clamp(ratio, 1 - self.clip_eps, 1 + self.clip_eps) * adv_block
 
-            policy_loss=-torch.min(sur1,sur2).mean()#为啥这里要取平均值，这是相对于哪个的平均
+            policy_loss=-torch.min(sur1,sur2).mean()
 
-            values=self.critic(obs).squeeze(-1)#这个squeeze是干嘛的
+            values=self.critic(obs_all).squeeze(-1)       # 每步状态 → 每步 V(s)（不变）
             value_loss=F.mse_loss(values,ret)
 
-            entropy=dist.entropy().mean()#这里咋又要取mean
+            entropy=dist.entropy().mean()                 # 决策点分布的熵
 
-            loss=policy_loss+self.val_coef*value_loss-self.ent_coef*entropy#这里为啥要乘val_coef
+            loss=policy_loss+self.val_coef*value_loss-self.ent_coef*entropy
 
             optimizer.zero_grad()
             loss.backward()

@@ -28,6 +28,8 @@ parser.add_argument("--k", type=int, default=4,
                     help="动作分块长度 K（默认 4）")
 parser.add_argument("--tag", type=str, default="",
                     help="输出文件后缀，如 --tag k8 → actor_k8.pt / training_log_k8.csv")
+parser.add_argument("--rolling", action="store_true",
+                    help="滚动时域：决策输出整块但只执行第 1 步，每步重新决策")
 args = parser.parse_args()
 max_iterations = args.iters
 
@@ -48,7 +50,11 @@ critic = Critic(obs_dim)
 
 if not args.fresh and exists(critic_path):
  critic.load_state_dict(torch.load(critic_path))
-buffer = RolloutBuffer(rollout_size, obs_dim, act_dim)
+if args.rolling:
+    # 滚动版：每行就是一个决策点，buffer 存整块动作（K×6 列）
+    buffer = RolloutBuffer(rollout_size, obs_dim, act_dim * args.k)
+else:
+    buffer = RolloutBuffer(rollout_size, obs_dim, act_dim)
 
 K = actor.K   # 动作块长度（默认 4）
 
@@ -65,33 +71,52 @@ for iteration in range(max_iterations):
         obs_t = torch.from_numpy(obs).float()
         with torch.no_grad():
             action_block, log_prob = actor.get_action(obs_t)   # (K,6) 动作块 + 整块 logp（标量）
-        dec_obs_np = obs_t.numpy()                             # 决策点状态，K 行共享
+        dec_obs_np = obs_t.numpy()                             # 决策点状态
 
-        # ===== 开环连续执行 K 步（块中途不重新决策） =====
-        for j in range(K):
-            if step >= rollout_size:
-                break
-            action_np = action_block[j].numpy()                # 第 j 步的动作
+        if args.rolling:
+            # ===== 滚动时域：只执行第 1 步，下一步用新状态重新决策 =====
+            action_np = action_block[0].numpy()
             next_obs, reward, terminated, truncated, _ = env.step(action_np)
             done = terminated or truncated
             with torch.no_grad():
-                value = critic(torch.from_numpy(obs).float()).item()   # 每步真实状态的 V(s)
-            buffer.store(obs, action_np, reward, done, log_prob.item(), value, dec_obs_np)
+                value = critic(torch.from_numpy(obs).float()).item()
+            buffer.store(obs, action_block.reshape(-1).numpy(), reward, done,
+                         log_prob.item(), value, dec_obs_np)
 
             episode_reward += reward
             obs = next_obs
             step += 1
 
-            if done:   # 块内终止：剩余动作丢弃，新 episode 从新状态重新决策
+            if done:
                 episode_rewards.append(episode_reward)
                 episode_reward = 0
                 obs, _ = env.reset()
-                break
+        else:
+            # ===== 开环连续执行 K 步（块中途不重新决策） =====
+            for j in range(K):
+                if step >= rollout_size:
+                    break
+                action_np = action_block[j].numpy()                # 第 j 步的动作
+                next_obs, reward, terminated, truncated, _ = env.step(action_np)
+                done = terminated or truncated
+                with torch.no_grad():
+                    value = critic(torch.from_numpy(obs).float()).item()   # 每步真实状态的 V(s)
+                buffer.store(obs, action_np, reward, done, log_prob.item(), value, dec_obs_np)
+
+                episode_reward += reward
+                obs = next_obs
+                step += 1
+
+                if done:   # 块内终止：剩余动作丢弃，新 episode 从新状态重新决策
+                    episode_rewards.append(episode_reward)
+                    episode_reward = 0
+                    obs, _ = env.reset()
+                    break
 
     advantages, returns = compute_gae(buffer, gamma, lam)
 
     # === 3. PPO update ===
-    ppo = PPO(actor, critic, buffer, epochs, advantages, returns)
+    ppo = PPO(actor, critic, buffer, epochs, advantages, returns, rolling=args.rolling)
     ppo.update()
 
     # === 4. 打印 reward + 记录日志（供 plot_results.py 出图） ===
@@ -100,7 +125,7 @@ for iteration in range(max_iterations):
         print(f"Iteration {iteration}, avg reward: {avg_reward:.1f}")
         with open(log_path, "a", newline="") as f:
             writer = csv.writer(f)
-            if iteration == 0:  # 首次写入表头
+            if iteration == 0 and not exists(log_path):  # 首次写入表头（续训时不重复写）
                 writer.writerow(["iteration", "avg_reward", "num_episodes"])
             writer.writerow([iteration, round(avg_reward, 2), len(episode_rewards)])
 
@@ -127,8 +152,12 @@ for _ in range(100):
     obs_t = torch.from_numpy(obs).float()
     with torch.no_grad():
         action_block, _ = actor.get_action(obs_t)   # (K,6) 动作块
-    for j in range(action_block.shape[0]):          # 块内逐个执行
-        next_obs, _, _, _, _ = env.step(action_block[j].numpy())
+    if args.rolling:
+        next_obs, _, _, _, _ = env.step(action_block[0].numpy())   # 滚动：只执行第 1 步
         obs = next_obs
+    else:
+        for j in range(action_block.shape[0]):          # 块内逐个执行
+            next_obs, _, _, _, _ = env.step(action_block[j].numpy())
+            obs = next_obs
 print("测试结束")
 env.close()

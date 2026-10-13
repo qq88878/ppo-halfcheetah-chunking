@@ -2,7 +2,7 @@
 
 从零手写一个**简化版 PPO（Proximal Policy Optimization）**，用 PyTorch + Gymnasium + MuJoCo 让仿真里的机器猎豹（HalfCheetah）学会跑步。
 
-不调用 stable-baselines3 等现成 RL 库，策略网络（Actor）、价值网络（Critic）、经验缓冲区（RolloutBuffer）、GAE 优势估计、clip 损失全部手写，理解 RL 训练的完整闭环。
+没有用 stable-baselines3 这类现成 RL 库：策略网络（Actor）、价值网络（Critic）、经验缓冲区（RolloutBuffer）、GAE 优势估计、clip 损失都是自己一行行写出来的。能跑通，中间也踩了不少坑（见第 7 节）。
 
 > ⭐ **本项目已升级「动作分块（Action Chunking）」**：决策 1 次输出 K=4 个连续动作 (4,6)，开环执行 4 步再决策——对标"预测一串动作"（VLA / ACT 的底层组件）。训练结果见 [6.2 动作分块实验](#62-动作分块实验action-chunking)。
 >
@@ -21,7 +21,7 @@
 | 环境奖励 | 前向速度 − 0.1 × ‖action‖²（原生） |
 | 额外实验 | StandUpWrapper 摔倒惩罚，让猎豹学会"站着跑" |
 
-### 训练闭环（一句话）
+### 训练流程（一句话）
 
 ```
 Agent 与 MuJoCo 环境交互收集轨迹 → 存入 RolloutBuffer → GAE 计算优势
@@ -129,10 +129,10 @@ class Critic(nn.Module):
 ```
 
 **要点**：
-- Actor 不直接输出动作，而是输出一个**高斯分布的 mean**，配合可学习的 `log_std` 组成分布，采样得到动作 → 保证有探索性。
-- **tanh 压缩**：`action = tanh(u)` 把任意实数平滑压进 (-1,1)，对齐 HalfCheetah 动作边界，是 SAC / 现代 PPO 的标准做法（Gaussian + Squash）。
+- Actor 不直接输出动作，而是输出一个**高斯分布的 mean**，配合可学习的 `log_std` 组成分布，采样得到动作 → 策略自带探索性。
+- **tanh 压缩**：`action = tanh(u)` 把任意实数平滑压进 (-1,1)，对齐 HalfCheetah 动作边界。这是 SAC / 现代 PPO 的标准做法（Gaussian + Squash），比直接 clip 动作干净——clip 会破坏分布形状，tanh 不会。
 - **雅可比修正**：`log p(a) = log p(u) − log(1−a²)`，把 tanh 挤压造成的概率密度变化补偿回去；采样侧与更新侧用同一公式，ratio 才自洽。
-- Critic 输出一个标量 V(s)，是"从 state s 出发未来累计奖励"的预测，作为 Actor 的"基线"。
+- Critic 输出一个标量 V(s)，是"从 state s 出发未来累计奖励"的预测，给 Actor 当"基线"用。
 
 ### 5.2 buffer.py — 经验回放缓冲区
 
@@ -320,7 +320,7 @@ class StandUpWrapper(gym.Wrapper):
 
 > 出图方法：`python train.py --fresh --k 4`（默认）→ 生成 `training_log.csv`，再执行 `python compare_chunking.py` 生成对比图 `reward_curve_chunking_vs_base.png`。
 
-**结论**：决策频率降到 1/4，性能只掉 4.7%（2404 → 2292），且曲线稳定上升——动作分块成立。真机上这意味着 4 倍算力节省/响应提速，正是 VLA 在部署侧的核心价值。
+**结论**：决策频率降到 1/4，性能只掉 4.7%（2404 → 2292），曲线还是稳定上升的——动作分块这条路能走。真机上少做 3/4 的决策，算力成本和响应延迟都降下来，这是 VLA 在部署侧愿意用动作分块的原因。
 
 **K 消融实验**（可选）：
 ```bash
@@ -345,7 +345,7 @@ python train.py --fresh --k 8 --tag k8 --iters 500 --no-render
 
 > 出图方法：`python train.py --fresh --rolling --k 4 --tag rolling --iters 500 --no-render`（初跑）→ `python train.py --rolling --k 4 --tag rolling --iters 1000 --no-render`（续训）→ 执行 `python compare_all_variants.py` 生成四版本对比图。
 
-**结论**：滚动 K=4（2422.8）**反超基线**（2404.0，+0.8%），比开环 K=4（2292.3）高 +5.7%。滚动保留了"预测一串动作"的执行形态（对标 VLA / MPC 部署侧的 receding horizon），又用每步重决策消除了开环的误差累积；纯 RL 里后几步动作没有独立 reward 的问题（详见笔记 Q5）被"每步都有真实新状态反馈"缓解，所以滚动能学、开环 K=8 不能。这验证了业界核心结论：**VLA 部署用滚动执行、训练用模仿学习（给整块 ground truth）**——前者被本实验亲手验证，后者是 RL 训练动作分块低效的原因。
+**结论**：滚动 K=4（2422.8）**反超基线**（2404.0，+0.8%），比开环 K=4（2292.3）高 +5.7%。滚动保留了"预测一串动作"的执行形态（对标 VLA / MPC 部署侧的 receding horizon），又用每步重决策消除了开环的误差累积。纯 RL 里后几步动作没有独立 reward（详见笔记 Q5），滚动相当于拿"每步真实新状态"把这个问题缓解了，所以滚动能学、开环 K=8 不能。做完这个对比，我对一句话有了切身感受：**VLA 部署用滚动执行、训练用模仿学习（给整块 ground truth）**——前者靠本实验验证了，后者解释了 RL 直接训动作分块为什么低效。
 
 ---
 
@@ -369,7 +369,7 @@ python train.py --fresh --k 8 --tag k8 --iters 500 --no-render
 4. **GAE 为什么从后往前滚**：用 TD 误差加权累计，平衡偏差与方差（λ 控制看多远）。
 5. **reward 工程**：原生 reward 没有站立惩罚 → Wrapper 加惩罚改变行为。
 6. **tanh 进阶（Gaussian + Squash）**：动作有边界时不用 clip 而用 tanh 平滑压缩 + 雅可比修正 `log p(a) = log p(u) − log(1−a²)`，采样侧与更新侧同一公式保证 ratio 自洽——对齐 SAC / 现代 PPO 标准做法，也是真机部署动作边界安全的第一道闸门。
-7. **数值稳定性实战**：训练中真实遇到 NaN 崩溃，定位完整链路（σ→0 × arctanh 极端 u → log_prob 爆炸），三处修复后稳定收敛且峰值 +12.8%——展示的不是"我调好了"，而是定位数值 bug 的能力。
+7. **数值稳定性实战**：训练中真实遇到 NaN 崩溃，定位完整链路（σ→0 × arctanh 极端 u → log_prob 爆炸），三处修复后稳定收敛且峰值 +12.8%——讲清楚这个，比说"我调好了"更有说服力。
 
 ---
 
@@ -377,7 +377,7 @@ python train.py --fresh --k 8 --tag k8 --iters 500 --no-render
 
 - 换环境：Humanoid-v5（站立行走）、机械臂 reach 任务
 - 从连续动作转向：动作空间结构不同的任务（position 控制 vs motor 力矩）
-- 结合课程：学 RRT / MPC / 运动规划，从"纯 RL"走向"感知-规划-控制"完整链路
+- 学 RRT / MPC / 运动规划，把"纯 RL"补成"感知-规划-控制"一条线
 - 为具身智能（真实机器人）打基础：仿真预训练 → sim-to-real
 
 ---
